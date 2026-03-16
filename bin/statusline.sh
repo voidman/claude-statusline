@@ -102,12 +102,12 @@ format_reset_time() {
     local result=""
     case "$style" in
         time)
-            result=$(date -j -r "$epoch" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]')
-            [ -z "$result" ] && result=$(date -d "@$epoch" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+            result=$(date -j -r "$epoch" +"%H:%M" 2>/dev/null)
+            [ -z "$result" ] && result=$(date -d "@$epoch" +"%H:%M" 2>/dev/null)
             ;;
         datetime)
-            result=$(date -j -r "$epoch" +"%b %-d, %l:%M%p" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]')
-            [ -z "$result" ] && result=$(date -d "@$epoch" +"%b %-d, %l:%M%P" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g')
+            result=$(date -j -r "$epoch" +"%Y-%m-%d %H:%M" 2>/dev/null)
+            [ -z "$result" ] && result=$(date -d "@$epoch" +"%Y-%m-%d %H:%M" 2>/dev/null)
             ;;
         *)
             result=$(date -j -r "$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
@@ -143,7 +143,7 @@ if [ -f "$settings_path" ]; then
     effort=$(jq -r '.effortLevel // "default"' "$settings_path" 2>/dev/null)
 fi
 
-# ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Thinking ──
+# ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
 pct_color=$(color_for_pct "$pct_used")
 cwd=$(echo "$input" | jq -r '.cwd // ""')
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
@@ -240,6 +240,21 @@ get_oauth_token() {
     echo ""
 }
 
+# ── Check if using official Anthropic API ──────────────────────────
+is_official_api() {
+    if [ -z "$ANTHROPIC_BASE_URL" ]; then
+        return 0
+    fi
+    case "$ANTHROPIC_BASE_URL" in
+        *api.anthropic.com*|*anthropic.com*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # ── Fetch usage data (cached) ──────────────────────────
 cache_file="/tmp/claude/statusline-usage-cache.json"
 cache_max_age=60
@@ -248,7 +263,7 @@ mkdir -p /tmp/claude
 needs_refresh=true
 usage_data=""
 
-if [ -f "$cache_file" ]; then
+if is_official_api && [ -f "$cache_file" ]; then
     cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
     now=$(date +%s)
     cache_age=$(( now - cache_mtime ))
@@ -258,7 +273,7 @@ if [ -f "$cache_file" ]; then
     fi
 fi
 
-if $needs_refresh; then
+if is_official_api && $needs_refresh; then
     token=$(get_oauth_token)
     if [ -n "$token" ] && [ "$token" != "null" ]; then
         response=$(curl -s --max-time 5 \
