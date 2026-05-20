@@ -143,7 +143,6 @@ if [ -f "$settings_path" ]; then
     effort=$(jq -r '.effortLevel // "default"' "$settings_path" 2>/dev/null)
 fi
 
-# ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
 pct_color=$(color_for_pct "$pct_used")
 cwd=$(echo "$input" | jq -r '.cwd // ""')
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
@@ -174,26 +173,6 @@ if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
         fi
     fi
 fi
-
-line1="${blue}${model_name}${reset}"
-line1+="${sep}"
-line1+="✍️ ${pct_color}${pct_used}%${reset}"
-line1+="${sep}"
-line1+="${cyan}${dirname}${reset}"
-if [ -n "$git_branch" ]; then
-    line1+=" ${green}(${git_branch}${red}${git_dirty}${green})${reset}"
-fi
-if [ -n "$session_duration" ]; then
-    line1+="${sep}"
-    line1+="${dim}⏱ ${reset}${white}${session_duration}${reset}"
-fi
-line1+="${sep}"
-case "$effort" in
-    high)   line1+="${magenta}● ${effort}${reset}" ;;
-    medium) line1+="${dim}◑ ${effort}${reset}" ;;
-    low)    line1+="${dim}◔ ${effort}${reset}" ;;
-    *)      line1+="${dim}◑ ${effort}${reset}" ;;
-esac
 
 # ── OAuth token resolution ──────────────────────────────
 get_oauth_token() {
@@ -255,15 +234,43 @@ is_official_api() {
     esac
 }
 
+# ── Check if using GLM API ─────────────────────────────────────────
+is_glm_api() {
+    case "$ANTHROPIC_BASE_URL" in
+        *api.z.ai*|*open.bigmodel.cn*|*dev.bigmodel.cn*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+derive_glm_quota_url() {
+    local base="$ANTHROPIC_BASE_URL"
+    base="${base%/}"
+    # Strip path, keep protocol + host
+    local proto="${base%%://*}://"
+    local rest="${base#*://}"
+    local host="${rest%%/*}"
+    echo "${proto}${host}/api/monitor/usage/quota/limit"
+}
+
 # ── Fetch usage data (cached) ──────────────────────────
-cache_file="/tmp/claude/statusline-usage-cache.json"
-cache_max_age=60
+if is_glm_api; then
+    cache_file="/tmp/claude/statusline-usage-cache-glm.json"
+elif is_official_api; then
+    cache_file="/tmp/claude/statusline-usage-cache-anthropic.json"
+else
+    cache_file="/tmp/claude/statusline-usage-cache.json"
+fi
+cache_max_age=30
 mkdir -p /tmp/claude
 
 needs_refresh=true
 usage_data=""
 
-if is_official_api && [ -f "$cache_file" ]; then
+if (is_official_api || is_glm_api) && [ -f "$cache_file" ]; then
     cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
     now=$(date +%s)
     cache_age=$(( now - cache_mtime ))
@@ -273,7 +280,22 @@ if is_official_api && [ -f "$cache_file" ]; then
     fi
 fi
 
-if is_official_api && $needs_refresh; then
+if is_glm_api && $needs_refresh; then
+    if [ -n "$ANTHROPIC_AUTH_TOKEN" ]; then
+        glm_quota_url=$(derive_glm_quota_url)
+        response=$(curl -s --max-time 5 \
+            -H "Accept: application/json" \
+            -H "Authorization: $ANTHROPIC_AUTH_TOKEN" \
+            "$glm_quota_url" 2>/dev/null)
+        if [ -n "$response" ] && echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
+            usage_data="$response"
+            echo "$response" > "$cache_file"
+        fi
+    fi
+    if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
+        usage_data=$(cat "$cache_file" 2>/dev/null)
+    fi
+elif is_official_api && $needs_refresh; then
     token=$(get_oauth_token)
     if [ -n "$token" ] && [ "$token" != "null" ]; then
         response=$(curl -s --max-time 5 \
@@ -295,8 +317,54 @@ fi
 
 # ── Rate limit lines ────────────────────────────────────
 rate_lines=""
+glm_level=""
 
-if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
+if is_glm_api && [ -n "$usage_data" ] && echo "$usage_data" | jq -e '.success == true' >/dev/null 2>&1; then
+    bar_width=10
+
+    # Extract subscription level
+    glm_level=$(echo "$usage_data" | jq -r '.data.level // ""')
+
+    # Prefer TOKENS_LIMIT (percent mode), fallback to TIME_LIMIT (absolute mode)
+    token_limit=$(echo "$usage_data" | jq '.data.limits[] | select(.type == "TOKENS_LIMIT" and .number == 5)' 2>/dev/null)
+
+    if [ -n "$token_limit" ]; then
+        five_hour_pct=$(echo "$token_limit" | jq -r '.percentage // 0' | awk '{printf "%.0f", $1}')
+        reset_ts=$(echo "$token_limit" | jq -r '.nextResetTime // 0')
+    else
+        time_limit=$(echo "$usage_data" | jq '.data.limits[] | select(.type == "TIME_LIMIT" and .unit == 5)' 2>/dev/null)
+        if [ -n "$time_limit" ]; then
+            remaining=$(echo "$time_limit" | jq -r '.remaining // 0')
+            usage=$(echo "$time_limit" | jq -r '.usage // 0')
+            if [ "$usage" -gt 0 ] 2>/dev/null; then
+                total="$usage"
+            else
+                current_val=$(echo "$time_limit" | jq -r '.currentValue // 0')
+                total=$(( remaining + current_val ))
+            fi
+            if [ "$total" -gt 0 ] 2>/dev/null; then
+                five_hour_pct=$(( (total - remaining) * 100 / total ))
+            else
+                five_hour_pct=0
+            fi
+            reset_ts=$(echo "$time_limit" | jq -r '.nextResetTime // 0')
+        fi
+    fi
+
+    if [ -n "$five_hour_pct" ]; then
+        # Convert millisecond timestamp to reset time
+        reset_epoch=$(( reset_ts / 1000 ))
+        five_hour_reset=$(date -j -r "$reset_epoch" +"%H:%M" 2>/dev/null)
+        [ -z "$five_hour_reset" ] && five_hour_reset=$(date -d "@$reset_epoch" +"%H:%M" 2>/dev/null)
+
+        five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
+        five_hour_pct_color=$(color_for_pct "$five_hour_pct")
+        five_hour_pct_fmt=$(printf "%3d" "$five_hour_pct")
+
+        rate_lines+="${white}current${reset} ${five_hour_bar} ${five_hour_pct_color}${five_hour_pct_fmt}%${reset} ${dim}⟳${reset} ${white}${five_hour_reset}${reset}"
+    fi
+
+elif [ -n "$usage_data" ] && echo "$usage_data" | jq -e '.five_hour' >/dev/null 2>&1; then
     bar_width=10
 
     five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
@@ -334,6 +402,32 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         rate_lines+="\n${extra_col}"
     fi
 fi
+
+# ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
+if [ -n "$glm_level" ]; then
+    glm_label="GLM $(echo "$glm_level" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')"
+    line1="${magenta}${glm_label}${reset}${sep}${blue}${model_name}${reset}"
+else
+    line1="${blue}${model_name}${reset}"
+fi
+line1+="${sep}"
+line1+="✍️ ${pct_color}${pct_used}%${reset}"
+line1+="${sep}"
+line1+="${cyan}${dirname}${reset}"
+if [ -n "$git_branch" ]; then
+    line1+=" ${green}(${git_branch}${red}${git_dirty}${green})${reset}"
+fi
+if [ -n "$session_duration" ]; then
+    line1+="${sep}"
+    line1+="${dim}⏱ ${reset}${white}${session_duration}${reset}"
+fi
+line1+="${sep}"
+case "$effort" in
+    high)   line1+="${magenta}● ${effort}${reset}" ;;
+    medium) line1+="${dim}◑ ${effort}${reset}" ;;
+    low)    line1+="${dim}◔ ${effort}${reset}" ;;
+    *)      line1+="${dim}◑ ${effort}${reset}" ;;
+esac
 
 # ── Output ──────────────────────────────────────────────
 printf "%b" "$line1"
