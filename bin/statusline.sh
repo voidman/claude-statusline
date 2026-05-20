@@ -62,9 +62,8 @@ format_epoch_time() {
             [ -z "$result" ] && result=$(date -d "@$epoch" +"%H:%M" 2>/dev/null)
             ;;
         datetime)
-            result=$(date -j -r "$epoch" +"%b %-d %H:%M" 2>/dev/null)
-            [ -z "$result" ] && result=$(date -d "@$epoch" +"%b %-d %H:%M" 2>/dev/null)
-            result=$(echo "$result" | tr '[:upper:]' '[:lower:]')
+            result=$(date -j -r "$epoch" +"%Y-%m-%d %H:%M" 2>/dev/null)
+            [ -z "$result" ] && result=$(date -d "@$epoch" +"%Y-%m-%d %H:%M" 2>/dev/null)
             ;;
         *)
             result=$(date -j -r "$epoch" +"%b %-d" 2>/dev/null)
